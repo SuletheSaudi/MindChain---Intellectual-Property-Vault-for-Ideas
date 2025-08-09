@@ -7,6 +7,9 @@
 (define-constant ERR_INVALID_PARAMETERS (err u400))
 (define-constant ERR_DISPUTE_EXISTS (err u410))
 (define-constant ERR_NOT_DISPUTABLE (err u411))
+(define-constant ERR_INSUFFICIENT_BALANCE (err u412))
+(define-constant ERR_INVALID_ROYALTY (err u413))
+(define-constant ERR_NO_EARNINGS (err u414))
 
 (define-non-fungible-token mindchain-ip uint)
 
@@ -57,6 +60,24 @@
   { reputation: uint, total-votes: uint }
 )
 
+(define-map royalty-agreements
+  { idea-id: uint }
+  {
+    royalty-rate: uint,
+    total-earned: uint,
+    total-withdrawn: uint,
+    active: bool
+  }
+)
+
+(define-map user-earnings
+  { user: principal, idea-id: uint }
+  {
+    earned: uint,
+    withdrawn: uint
+  }
+)
+
 (define-read-only (get-last-token-id)
   (ok (- (var-get token-id-nonce) u1))
 )
@@ -98,6 +119,22 @@
   (var-get contract-paused)
 )
 
+(define-read-only (get-royalty-agreement (idea-id uint))
+  (map-get? royalty-agreements { idea-id: idea-id })
+)
+
+(define-read-only (get-user-earnings (user principal) (idea-id uint))
+  (default-to { earned: u0, withdrawn: u0 }
+    (map-get? user-earnings { user: user, idea-id: idea-id })
+  )
+)
+
+(define-read-only (get-available-earnings (user principal) (idea-id uint))
+  (let ((earnings (get-user-earnings user idea-id)))
+    (- (get earned earnings) (get withdrawn earnings))
+  )
+)
+
 (define-private (increment-token-id)
   (let ((current-id (var-get token-id-nonce)))
     (var-set token-id-nonce (+ current-id u1))
@@ -118,6 +155,10 @@
     (< (len title) u101)
     (is-eq (len idea-hash) u32)
   )
+)
+
+(define-private (validate-royalty-rate (rate uint))
+  (and (> rate u0) (<= rate u10000))
 )
 
 (define-public (submit-idea 
@@ -316,5 +357,106 @@
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (var-set contract-paused false)
     (ok true)
+  )
+)
+
+(define-public (setup-royalty-agreement (idea-id uint) (royalty-rate uint))
+  (let 
+    (
+      (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+    (asserts! (validate-royalty-rate royalty-rate) ERR_INVALID_ROYALTY)
+    (asserts! 
+      (is-none (get-royalty-agreement idea-id))
+      ERR_ALREADY_EXISTS
+    )
+    
+    (map-set royalty-agreements
+      { idea-id: idea-id }
+      {
+        royalty-rate: royalty-rate,
+        total-earned: u0,
+        total-withdrawn: u0,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (pay-royalty (idea-id uint) (amount uint))
+  (let 
+    (
+      (agreement (unwrap! (get-royalty-agreement idea-id) ERR_NOT_FOUND))
+      (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
+      (royalty-amount (/ (* amount (get royalty-rate agreement)) u10000))
+      (current-earnings (get-user-earnings token-owner idea-id))
+    )
+    (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+    (asserts! (get active agreement) ERR_INVALID_PARAMETERS)
+    (asserts! (> amount u0) ERR_INVALID_PARAMETERS)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set royalty-agreements
+      { idea-id: idea-id }
+      (merge agreement { total-earned: (+ (get total-earned agreement) royalty-amount) })
+    )
+    
+    (map-set user-earnings
+      { user: token-owner, idea-id: idea-id }
+      {
+        earned: (+ (get earned current-earnings) royalty-amount),
+        withdrawn: (get withdrawn current-earnings)
+      }
+    )
+    (ok royalty-amount)
+  )
+)
+
+(define-public (withdraw-earnings (idea-id uint))
+  (let 
+    (
+      (available (get-available-earnings tx-sender idea-id))
+      (current-earnings (get-user-earnings tx-sender idea-id))
+      (agreement (unwrap! (get-royalty-agreement idea-id) ERR_NOT_FOUND))
+    )
+    (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> available u0) ERR_NO_EARNINGS)
+    
+    (try! (as-contract (stx-transfer? available tx-sender tx-sender)))
+    
+    (map-set user-earnings
+      { user: tx-sender, idea-id: idea-id }
+      {
+        earned: (get earned current-earnings),
+        withdrawn: (+ (get withdrawn current-earnings) available)
+      }
+    )
+    
+    (map-set royalty-agreements
+      { idea-id: idea-id }
+      (merge agreement { total-withdrawn: (+ (get total-withdrawn agreement) available) })
+    )
+    (ok available)
+  )
+)
+
+(define-public (toggle-royalty-status (idea-id uint))
+  (let 
+    (
+      (agreement (unwrap! (get-royalty-agreement idea-id) ERR_NOT_FOUND))
+      (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+    
+    (map-set royalty-agreements
+      { idea-id: idea-id }
+      (merge agreement { active: (not (get active agreement)) })
+    )
+    (ok (not (get active agreement)))
   )
 )
