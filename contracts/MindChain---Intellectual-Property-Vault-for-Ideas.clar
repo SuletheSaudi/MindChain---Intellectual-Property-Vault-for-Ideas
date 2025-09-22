@@ -27,7 +27,8 @@
     block-height: uint,
     license-terms: (optional (string-ascii 500)),
     is-public: bool,
-    dispute-count: uint
+    dispute-count: uint,
+    latest-version: uint
   }
 )
 
@@ -75,6 +76,15 @@
   {
     earned: uint,
     withdrawn: uint
+  }
+)
+
+(define-map idea-versions
+  { idea-id: uint, version: uint }
+  {
+    hash: (buff 32),
+    timestamp: uint,
+    changes: (string-ascii 200)
   }
 )
 
@@ -135,6 +145,10 @@
   )
 )
 
+(define-read-only (get-idea-version (idea-id uint) (version uint))
+  (map-get? idea-versions { idea-id: idea-id, version: version })
+)
+
 (define-private (increment-token-id)
   (let ((current-id (var-get token-id-nonce)))
     (var-set token-id-nonce (+ current-id u1))
@@ -161,13 +175,17 @@
   (and (> rate u0) (<= rate u10000))
 )
 
-(define-public (submit-idea 
+(define-private (validate-version-params (changes (string-ascii 200)) (new-hash (buff 32)))
+  (and (> (len changes) u0) (< (len changes) u201) (is-eq (len new-hash) u32))
+)
+
+(define-public (submit-idea
   (title (string-ascii 100))
   (idea-hash (buff 32))
   (license-terms (optional (string-ascii 500)))
   (is-public bool)
 )
-  (let 
+  (let
     (
       (idea-id (increment-token-id))
       (current-height stacks-block-height)
@@ -175,13 +193,13 @@
     )
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
     (asserts! (validate-idea-params title idea-hash) ERR_INVALID_PARAMETERS)
-    (asserts! 
+    (asserts!
       (is-none (map-get? idea-ownership { creator: tx-sender, idea-hash: idea-hash }))
       ERR_ALREADY_EXISTS
     )
-    
+
     (try! (nft-mint? mindchain-ip idea-id tx-sender))
-    
+
     (map-set ideas
       { idea-id: idea-id }
       {
@@ -192,15 +210,21 @@
         block-height: current-height,
         license-terms: license-terms,
         is-public: is-public,
-        dispute-count: u0
+        dispute-count: u0,
+        latest-version: u1
       }
     )
-    
+
+    (map-set idea-versions
+      { idea-id: idea-id, version: u1 }
+      { hash: idea-hash, timestamp: current-time, changes: "" }
+    )
+
     (map-set idea-ownership
       { creator: tx-sender, idea-hash: idea-hash }
       { idea-id: idea-id, timestamp: current-time }
     )
-    
+
     (ok idea-id)
   )
 )
@@ -213,14 +237,14 @@
 )
 
 (define-public (update-license-terms (idea-id uint) (new-terms (string-ascii 500)))
-  (let 
+  (let
     (
       (idea (unwrap! (get-idea idea-id) ERR_NOT_FOUND))
       (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
     )
     (asserts! (is-eq tx-sender token-owner) ERR_UNAUTHORIZED)
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
-    
+
     (map-set ideas
       { idea-id: idea-id }
       (merge idea { license-terms: (some new-terms) })
@@ -230,14 +254,14 @@
 )
 
 (define-public (toggle-idea-visibility (idea-id uint))
-  (let 
+  (let
     (
       (idea (unwrap! (get-idea idea-id) ERR_NOT_FOUND))
       (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
     )
     (asserts! (is-eq tx-sender token-owner) ERR_UNAUTHORIZED)
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
-    
+
     (map-set ideas
       { idea-id: idea-id }
       (merge idea { is-public: (not (get is-public idea)) })
@@ -247,7 +271,7 @@
 )
 
 (define-public (create-dispute (idea-id uint) (evidence-hash (buff 32)))
-  (let 
+  (let
     (
       (idea (unwrap! (get-idea idea-id) ERR_NOT_FOUND))
       (dispute-id (increment-dispute-id))
@@ -255,7 +279,7 @@
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
     (asserts! (not (is-eq tx-sender (get creator idea))) ERR_UNAUTHORIZED)
     (asserts! (is-eq (len evidence-hash) u32) ERR_INVALID_PARAMETERS)
-    
+
     (map-set disputes
       { dispute-id: dispute-id }
       {
@@ -269,18 +293,18 @@
         resolved-at: none
       }
     )
-    
+
     (map-set ideas
       { idea-id: idea-id }
       (merge idea { dispute-count: (+ (get dispute-count idea) u1) })
     )
-    
+
     (ok dispute-id)
   )
 )
 
 (define-public (vote-on-dispute (dispute-id uint) (vote-for bool))
-  (let 
+  (let
     (
       (dispute (unwrap! (get-dispute dispute-id) ERR_NOT_FOUND))
       (voter-rep (get-voter-reputation tx-sender))
@@ -288,20 +312,20 @@
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
     (asserts! (is-eq (get status dispute) "active") ERR_NOT_DISPUTABLE)
     (asserts! (not (has-voted dispute-id tx-sender)) ERR_ALREADY_EXISTS)
-    
+
     (map-set dispute-votes
       { dispute-id: dispute-id, voter: tx-sender }
       { vote: vote-for, timestamp: stacks-block-height }
     )
-    
+
     (map-set voter-reputation
       { voter: tx-sender }
-      { 
+      {
         reputation: (get reputation voter-rep),
         total-votes: (+ (get total-votes voter-rep) u1)
       }
     )
-    
+
     (if vote-for
       (map-set disputes
         { dispute-id: dispute-id }
@@ -317,7 +341,7 @@
 )
 
 (define-public (resolve-dispute (dispute-id uint))
-  (let 
+  (let
     (
       (dispute (unwrap! (get-dispute dispute-id) ERR_NOT_FOUND))
       (votes-for (get votes-for dispute))
@@ -327,14 +351,14 @@
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
     (asserts! (is-eq (get status dispute) "active") ERR_NOT_DISPUTABLE)
     (asserts! (>= total-votes u5) ERR_INVALID_PARAMETERS)
-    
-    (let 
+
+    (let
       (
         (resolved-status (if (> votes-for votes-against) "upheld" "rejected"))
       )
       (map-set disputes
         { dispute-id: dispute-id }
-        (merge dispute { 
+        (merge dispute {
           status: resolved-status,
           resolved-at: (some stacks-block-height)
         })
@@ -361,18 +385,18 @@
 )
 
 (define-public (setup-royalty-agreement (idea-id uint) (royalty-rate uint))
-  (let 
+  (let
     (
       (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
     )
     (asserts! (is-eq tx-sender token-owner) ERR_UNAUTHORIZED)
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
     (asserts! (validate-royalty-rate royalty-rate) ERR_INVALID_ROYALTY)
-    (asserts! 
+    (asserts!
       (is-none (get-royalty-agreement idea-id))
       ERR_ALREADY_EXISTS
     )
-    
+
     (map-set royalty-agreements
       { idea-id: idea-id }
       {
@@ -387,7 +411,7 @@
 )
 
 (define-public (pay-royalty (idea-id uint) (amount uint))
-  (let 
+  (let
     (
       (agreement (unwrap! (get-royalty-agreement idea-id) ERR_NOT_FOUND))
       (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
@@ -397,14 +421,14 @@
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
     (asserts! (get active agreement) ERR_INVALID_PARAMETERS)
     (asserts! (> amount u0) ERR_INVALID_PARAMETERS)
-    
+
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-    
+
     (map-set royalty-agreements
       { idea-id: idea-id }
       (merge agreement { total-earned: (+ (get total-earned agreement) royalty-amount) })
     )
-    
+
     (map-set user-earnings
       { user: token-owner, idea-id: idea-id }
       {
@@ -417,7 +441,7 @@
 )
 
 (define-public (withdraw-earnings (idea-id uint))
-  (let 
+  (let
     (
       (available (get-available-earnings tx-sender idea-id))
       (current-earnings (get-user-earnings tx-sender idea-id))
@@ -425,9 +449,9 @@
     )
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
     (asserts! (> available u0) ERR_NO_EARNINGS)
-    
+
     (try! (as-contract (stx-transfer? available tx-sender tx-sender)))
-    
+
     (map-set user-earnings
       { user: tx-sender, idea-id: idea-id }
       {
@@ -435,7 +459,7 @@
         withdrawn: (+ (get withdrawn current-earnings) available)
       }
     )
-    
+
     (map-set royalty-agreements
       { idea-id: idea-id }
       (merge agreement { total-withdrawn: (+ (get total-withdrawn agreement) available) })
@@ -445,18 +469,41 @@
 )
 
 (define-public (toggle-royalty-status (idea-id uint))
-  (let 
+  (let
     (
       (agreement (unwrap! (get-royalty-agreement idea-id) ERR_NOT_FOUND))
       (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
     )
     (asserts! (is-eq tx-sender token-owner) ERR_UNAUTHORIZED)
     (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
-    
+
     (map-set royalty-agreements
       { idea-id: idea-id }
       (merge agreement { active: (not (get active agreement)) })
     )
     (ok (not (get active agreement)))
+  )
+)
+
+(define-public (submit-idea-version (idea-id uint) (new-hash (buff 32)) (changes (string-ascii 200)))
+  (let
+    (
+      (idea (unwrap! (get-idea idea-id) ERR_NOT_FOUND))
+      (token-owner (unwrap! (nft-get-owner? mindchain-ip idea-id) ERR_NOT_FOUND))
+      (current-version (get latest-version idea))
+      (new-version (+ current-version u1))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+    (asserts! (validate-version-params changes new-hash) ERR_INVALID_PARAMETERS)
+    (map-set idea-versions
+      { idea-id: idea-id, version: new-version }
+      { hash: new-hash, timestamp: stacks-block-height, changes: changes }
+    )
+    (map-set ideas
+      { idea-id: idea-id }
+      (merge idea { idea-hash: new-hash, latest-version: new-version })
+    )
+    (ok new-version)
   )
 )
